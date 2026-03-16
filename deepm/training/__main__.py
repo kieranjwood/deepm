@@ -21,6 +21,7 @@ from deepm.training.data_setup import (
     compute_scalers,
     create_datasets,
     load_and_filter_data,
+    validate_tickers_in_tcost,
 )
 from deepm.training.hp_tuner import Tuner
 from deepm.utils.logging_utils import get_logger
@@ -42,6 +43,7 @@ def run(
     settings = copy.deepcopy(settings)
 
     data = load_and_filter_data(settings, data_parquet, end_date)
+    validate_tickers_in_tcost(settings, data)
     corr_feat = build_correlation_features(settings, data)
     windows = build_windows(settings, filter_start_years)
 

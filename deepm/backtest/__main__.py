@@ -8,6 +8,7 @@ Usage::
 
 import argparse
 import os
+import sys
 import time
 
 import yaml
@@ -15,9 +16,39 @@ import yaml
 from deepm._paths import BACKTEST_SETTINGS_DIR, TRAIN_SETTINGS_DIR
 from deepm.backtest.signal_backtest import SignalBacktestJob
 from deepm.backtest.signal_backtest_ensemble import EnsembleSignalBacktestJob
+from deepm.data.dataset import get_transaction_costs
 from deepm.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
+
+def _validate_tickers_in_tcost(configs):
+    """Check that all universe tickers appear in the transaction cost file."""
+    tcost_file = configs.get("ticker_reference_file")
+    if tcost_file is None:
+        return
+
+    ticker_ref = get_transaction_costs(tcost_file)
+    ticker_mapping = configs.get("ticker_mapping")
+    if ticker_mapping is not None:
+        ticker_ref["ticker"] = ticker_ref["ticker"].map(ticker_mapping)
+
+    universe = configs.get("universe", {})
+    universe_tickers = set(universe.keys())
+    if ticker_mapping is not None:
+        universe_tickers = {ticker_mapping.get(t, t) for t in universe_tickers}
+
+    tcost_tickers = set(ticker_ref["ticker"].dropna().unique())
+    missing = universe_tickers - tcost_tickers
+
+    if missing:
+        logger.error(
+            "The following tickers are in the backtest universe but missing from "
+            "the transaction cost file '%s': %s",
+            tcost_file,
+            sorted(missing),
+        )
+        sys.exit(1)
 
 
 def _resolve_tickers(configs, override_tickers=None):
@@ -114,6 +145,8 @@ def main():
 
     with open(BACKTEST_SETTINGS_DIR / f"{args.name}.yaml", encoding="utf-8") as f:
         configs = yaml.safe_load(f)
+
+    _validate_tickers_in_tcost(configs)
 
     if args.ensemble:
         _run_ensemble(args, configs)

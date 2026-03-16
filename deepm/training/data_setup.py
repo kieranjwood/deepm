@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 import pandas as pd
 from colorama import Fore, Style
 
@@ -18,6 +20,29 @@ from deepm.data.dataset import (
 from deepm.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
+
+def validate_tickers_in_tcost(settings: dict, data: pd.DataFrame) -> None:
+    """Check that all data tickers appear in the transaction cost file.
+
+    Exits with a clear error message if any tickers are missing.
+    """
+    ticker_ref = get_transaction_costs(settings["ticker_reference_file"])
+    if settings.get("ticker_mapping") is not None:
+        ticker_ref["ticker"] = ticker_ref["ticker"].map(settings["ticker_mapping"])
+
+    data_tickers = set(data.ticker.unique())
+    tcost_tickers = set(ticker_ref["ticker"].dropna().unique())
+    missing = data_tickers - tcost_tickers
+
+    if missing:
+        logger.error(
+            "The following tickers are in the data but missing from the "
+            "transaction cost file '%s': %s",
+            settings["ticker_reference_file"],
+            sorted(missing),
+        )
+        sys.exit(1)
 
 
 def load_and_filter_data(
