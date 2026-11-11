@@ -18,7 +18,26 @@ from deepm.training.grad_accum import train_step_exact_chunked
 from deepm.utils.logging_utils import get_logger
 from deepm.utils.metrics import calmar_ratio, sharpe_ratio
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+def _select_device() -> torch.device:
+    """CUDA > MPS > CPU; override with env DEEPM_DEVICE=cpu|mps|cuda:0."""
+    override = os.environ.get("DEEPM_DEVICE")
+    if override:
+        return torch.device(override)
+    if torch.cuda.is_available():
+        return torch.device("cuda:0")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def empty_device_cache() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+
+device = _select_device()
 
 
 class TrainDeepMomentumNetwork:
@@ -169,7 +188,7 @@ class TrainDeepMomentumNetwork:
             )
         finally:
             del model
-            torch.cuda.empty_cache()
+            empty_device_cache()
 
     @staticmethod
     def get_q(
@@ -431,7 +450,8 @@ class TrainDeepMomentumNetwork:
         """Run inference/live predictions and return positions DataFrame."""
         assert mode in [DmnMode.INFERENCE, DmnMode.LIVE]
 
-        model.load_state_dict(torch.load(model_save_path))
+        # map_location: a checkpoint trained on CUDA must also load on a CPU / MPS machine
+        model.load_state_dict(torch.load(model_save_path, map_location=device))
         model.eval()
 
         buffers = self._run_inference_loop(model, batch_size, mode)

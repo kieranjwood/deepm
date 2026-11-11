@@ -56,14 +56,17 @@ def _slice_batch(obj: object, sl: slice) -> object:
 def _get_rng_state() -> tuple:
     cpu = torch.get_rng_state()
     cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-    return (cpu, cuda)
+    mps = torch.mps.get_rng_state() if torch.backends.mps.is_available() else None
+    return (cpu, cuda, mps)
 
 
 def _set_rng_state(state: tuple) -> None:
-    cpu, cuda = state
+    cpu, cuda, mps = state
     torch.set_rng_state(cpu)
     if cuda is not None:
         torch.cuda.set_rng_state_all(cuda)
+    if mps is not None:
+        torch.mps.set_rng_state(mps)
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +76,8 @@ def _set_rng_state(state: tuple) -> None:
 @torch.no_grad()
 def _stream_sum_sumsq(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Accumulate sum and sum-of-squares in float64 for numerical stability."""
+    if x.device.type == "mps":  # MPS has no float64
+        x = x.cpu()
     xd = x.double()
     return xd.sum(), (xd * xd).sum(), x.numel()
 
@@ -179,8 +184,9 @@ def train_step_exact_chunked(
     # PASS 1 (no_grad): pooled stats (+ per-sample SR & softmin weights)
     # -------------------------
     rng_states = []
-    sum_x = torch.zeros((), device=device, dtype=torch.float64)
-    sum_x2 = torch.zeros((), device=device, dtype=torch.float64)
+    acc_device = "cpu" if torch.device(device).type == "mps" else device  # MPS has no float64
+    sum_x = torch.zeros((), device=acc_device, dtype=torch.float64)
+    sum_x2 = torch.zeros((), device=acc_device, dtype=torch.float64)
     n_total = 0
 
     sharpe_list = []
