@@ -10,7 +10,7 @@ import torch
 
 import wandb
 
-from deepm.training.train import TrainDeepMomentumNetwork
+from deepm.training.train import TrainDeepMomentumNetwork, empty_device_cache
 from deepm.utils.logging_utils import get_logger
 from deepm.configs.settings import WANDB_ENTITY
 
@@ -211,7 +211,7 @@ class Tuner:
                 }, step=None)
         finally:
             gc.collect()
-            torch.cuda.empty_cache()
+            empty_device_cache()
 
     def _save_trial_artifacts(self, name, hp, test_sharpe, test_sharpe_net, valid_sharpe):
         """Save settings JSON and data params pickle for a completed trial."""
