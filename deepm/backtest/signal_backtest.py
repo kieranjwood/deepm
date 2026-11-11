@@ -87,7 +87,8 @@ class SignalBacktestJob:
         model, smooth_signal_span = self._instantiate_model()
 
         self.dataframe = pd.read_parquet(self.load_data_path)
-        self.dataframe["ticker"] = self.dataframe["ticker"].map(self.ticker_mapping)
+        if self.ticker_mapping:  # mapping with an empty dict would turn every ticker into NaN
+            self.dataframe["ticker"] = self.dataframe["ticker"].map(self.ticker_mapping)
 
         extra_params = {}
         if self.variable_importance_mode:
@@ -455,9 +456,10 @@ class SignalBacktestJob:
 
         reference = self._load_reference_data()
         transaction_costs = get_transaction_costs(self.transaction_cost_path)
-        transaction_costs["ticker"] = transaction_costs["ticker"].map(
-            self.ticker_mapping
-        )
+        if self.ticker_mapping:
+            transaction_costs["ticker"] = transaction_costs["ticker"].map(
+                self.ticker_mapping
+            )
 
         positions = self.calc_returns(
             predictions, transaction_costs, reference, scale_to_target_vol=False
