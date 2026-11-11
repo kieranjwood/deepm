@@ -1,8 +1,10 @@
 import copy
 import gc
+import glob
 import json
 import os
 import pickle
+import re
 
 import numpy as np
 import pandas as pd
@@ -110,6 +112,8 @@ class Tuner:
 
     def hyperparameter_optimisation(self):
         self.iteration = 0
+        if self._use_local_sweep():
+            return self._local_hyperparameter_optimisation()
         self._ensure_wandb_login()
 
         sweep_id, num_completed = self._resume_or_create_sweep()
@@ -125,6 +129,165 @@ class Tuner:
             count=remaining,
         )
         return self._save_sweep_results(sweep_id)
+
+    # ── Local random search (no wandb server needed) ──────────────
+
+    def _use_local_sweep(self) -> bool:
+        """Sweeps need the wandb server; fall back to a local random search
+        when wandb is offline/disabled or ``local_sweep: true`` is set."""
+        return bool(self.settings.get("local_sweep")) or os.environ.get(
+            "WANDB_MODE", ""
+        ).lower() in ("offline", "disabled", "dryrun")
+
+    def _sample_hp(self, rng: np.random.Generator) -> dict:
+        hp = {}
+        for k, spec in self.sweep_settings["parameters"].items():
+            if "values" in spec:
+                vals = spec["values"]
+                hp[k] = vals[int(rng.integers(len(vals)))]
+            elif "value" in spec:
+                hp[k] = spec["value"]
+            else:
+                raise NotImplementedError(f"Local sweep only supports value/values: {k}={spec}")
+            if isinstance(hp[k], np.generic):
+                hp[k] = hp[k].item()
+        if "max_gradient_norm" in hp:
+            hp["max_gradient_norm"] = float(hp["max_gradient_norm"])
+        return hp
+
+    def _local_hyperparameter_optimisation(self):
+        """Random search equivalent to the wandb sweep. Trial i uses seed ``local_sweep_seed + i`` for both
+        HP sampling and torch init. Each finished trial is written atomically to ``local_trials/local-<i>.json``
+        (status ok/failed). A trial counts as done only if its
+        summary metrics are finite and its seed matches, so an interrupted search resumes, a trial that raises
+        is recorded and skipped (``DEEPM_RETRY_FAILED=1`` retries it) instead of stopping the search, and rows
+        from another sweep/seed or with i >= random_search_max_iterations are ignored.
+
+        Parallel shards: with env ``DEEPM_SHARD=k/n`` this process runs only the trials with ``i % n == k``,
+        so n processes can share one GPU (``scripts/run_sharded.sh``). Shards never write
+        all_runs/best_runs; one final run without DEEPM_SHARD aggregates (it finds every trial done)."""
+        os.environ.setdefault("WANDB_MODE", "disabled")
+        shard = os.environ.get("DEEPM_SHARD")
+        k, n = (int(x) for x in shard.split("/")) if shard else (0, 1)
+        if not 0 <= k < n:
+            raise ValueError(f"DEEPM_SHARD must be k/n with 0 <= k < n, got {shard!r}")
+        total = self.settings["random_search_max_iterations"]
+        base_seed = int(self.settings.get("local_sweep_seed", 0))
+        done = self._local_trial_records(base_seed)
+        failed = set() if os.environ.get("DEEPM_RETRY_FAILED") == "1" else self._failed_local_trials()
+        todo = [i for i in range(total)
+                if i % n == k and f"local-{i}" not in done and f"local-{i}" not in failed]
+        self.logger.info(
+            "Local random search: %s/%s trials done (%s failed), this process (shard %s/%s) runs %s (%s)",
+            sum(int(nm.split("-")[1]) < total for nm in done), total, len(failed), k, n, len(todo), self.save_path,
+        )
+
+        for i in todo:
+            name = f"local-{i}"
+            seed = base_seed + i
+            hp = self._sample_hp(np.random.default_rng(seed))
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+            self.iteration = i + 1
+            self.logger.info("----Local random search iteration %s/%s (%s)----", i + 1, total, name)
+            self.logger.info("----%s---- hp=%s", self.settings["description"], hp)
+            try:
+                (
+                    test_sharpe, valid_sharpe, test_sharpe_net,
+                    test_calmar, test_calmar_net,
+                ) = self.model_training.run(
+                    architecture=self.architecture,
+                    log_wandb=False,
+                    wandb_run_name=name,
+                    **self.settings,
+                    **hp,
+                )
+                self._save_trial_artifacts(name, hp, test_sharpe, test_sharpe_net, valid_sharpe)
+                rec = {
+                    "status": "ok",
+                    "valid_loss_best": valid_sharpe,
+                    "test_sharpe_gross": test_sharpe,
+                    "test_sharpe_net": test_sharpe_net,
+                    "test_calmar_gross": test_calmar,
+                    "test_calmar_net": test_calmar_net,
+                    "seed": seed,
+                    **hp,
+                }
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as e:  # record and move on: one bad draw (e.g. OOM) must not block the search
+                self.logger.exception("trial %s failed", name)
+                rec = {"status": "failed", "error": repr(e)[:500], "seed": seed, **hp}
+            finally:
+                gc.collect()
+                empty_device_cache()
+            self._write_local_trial(name, rec)
+
+        if shard:  # shards would race on all_runs/best_runs; the final unsharded run aggregates
+            return None
+        return self._save_local_results(total, base_seed)
+
+    def _write_local_trial(self, name, rec):
+        """Atomic write (tmp file + os.replace): a killed process leaves no half-written record."""
+        d = os.path.join(self.save_path, "local_trials")
+        os.makedirs(d, exist_ok=True)
+        tmp = os.path.join(d, f".{name}.json.tmp{os.getpid()}")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(rec, f, cls=NumpyEncoder)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, os.path.join(d, f"{name}.json"))
+
+    def _read_local_trials(self):
+        """name -> record from local_trials/local-*.json."""
+        recs = {}
+        for path in sorted(glob.glob(os.path.join(self.save_path, "local_trials", "local-*.json"))):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    recs[os.path.basename(path)[:-5]] = json.load(f)
+            except (OSError, ValueError) as e:
+                self.logger.warning("skipping unreadable trial record %s: %s", path, e)
+        return recs
+
+    @staticmethod
+    def _valid_local_trial(name, rec, base_seed):
+        m = re.fullmatch(r"local-(\d+)", name)
+        if not m or rec.get("status", "ok") != "ok":
+            return False
+        try:
+            vals = [float(rec[key]) for key in SUMMARY_KEYS]
+            seed_ok = int(float(rec["seed"])) == base_seed + int(m.group(1))
+        except (KeyError, TypeError, ValueError):
+            return False
+        return seed_ok and bool(np.all(np.isfinite(vals)))
+
+    def _local_trial_records(self, base_seed):
+        return {nm: r for nm, r in self._read_local_trials().items() if self._valid_local_trial(nm, r, base_seed)}
+
+    def _failed_local_trials(self):
+        return {nm for nm, r in self._read_local_trials().items() if r.get("status") == "failed"}
+
+    def _save_local_results(self, total, base_seed):
+        recs = {nm: r for nm, r in self._local_trial_records(base_seed).items() if int(nm.split("-")[1]) < total}
+        if not recs:
+            raise RuntimeError(f"no completed trials in {self.save_path}")
+        if len(recs) < total:
+            self.logger.warning("only %s of %s trials completed in %s", len(recs), total, self.save_path)
+        all_runs = pd.DataFrame.from_dict(
+            {nm: {key: float(r[key]) for key in SUMMARY_KEYS} for nm, r in recs.items()}, orient="index"
+        ).sort_values("valid_loss_best", ascending=False)
+        best_runs = all_runs.head(self.settings["top_n_seeds"])
+        all_runs.to_csv(os.path.join(self.save_path, "all_runs.csv"))
+        best_runs.to_csv(os.path.join(self.save_path, "best_runs.csv"))
+        best_means = best_runs.mean()
+        best_means.to_json(os.path.join(self.save_path, "best_runs_mean.json"), indent=4)
+        return (
+            best_means.loc["test_sharpe_gross"],
+            best_means.loc["test_sharpe_net"],
+            best_means.loc["valid_loss_best"],
+            best_means.loc["test_calmar_gross"],
+            best_means.loc["test_calmar_net"],
+        )
 
     @staticmethod
     def _ensure_wandb_login():

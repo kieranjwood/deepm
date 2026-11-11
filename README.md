@@ -110,6 +110,22 @@ To run training without a wandb account, use offline mode:
 export WANDB_MODE=offline
 ```
 
+wandb sweeps need the wandb server, so in offline (or `disabled`) mode — or with `local_sweep: true` in the
+training config — the hyperparameter search runs as an equivalent **local random search** over the same sweep
+file. Trial `i` uses seed `local_sweep_seed + i` (default 0) for both the hyperparameter draw and model
+initialisation. Each finished trial is written to `local_trials/local-<i>.json` in the run directory, so an
+interrupted search resumes where it stopped; a trial that raises is recorded and skipped
+(`DEEPM_RETRY_FAILED=1` retries it).
+
+To run several trials in parallel on one GPU, start `n` processes with `DEEPM_SHARD=k/n` (`k = 0..n-1`), then run
+once without it to aggregate `all_runs.csv` / `best_runs.csv`. `scripts/run_sharded.sh <train_yaml> <arch> <n>`
+does both.
+
+### Device
+
+Training and inference use CUDA if available, otherwise Apple Silicon (MPS), otherwise CPU. Set
+`DEEPM_DEVICE=cpu|mps|cuda:0` to override.
+
 ## Data
 
 ### Raw data (`data/data_dec25.parquet`)
